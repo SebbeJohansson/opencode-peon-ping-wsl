@@ -88,7 +88,8 @@ interface CESPManifest {
 }
 
 interface PeonConfig {
-  active_pack: string
+  default_pack: string
+  active_pack?: string // legacy alias for default_pack
   volume: number
   enabled: boolean
   desktop_notifications: boolean
@@ -156,7 +157,7 @@ const PAUSED_PATH = path.join(PLUGIN_DIR, ".paused")
 const DEFAULT_PACKS_DIR = path.join(os.homedir(), ".openpeon", "packs")
 
 const DEFAULT_CONFIG: PeonConfig = {
-  active_pack: "peon",
+  default_pack: "peon",
   volume: 0.5,
   enabled: true,
   desktop_notifications: true,
@@ -379,11 +380,12 @@ function resolveActivePack(
     }
   }
 
-  if (available.includes(config.active_pack)) {
-    return config.active_pack
+  const activePack = config.default_pack || config.active_pack || "peon"
+  if (available.includes(activePack)) {
+    return activePack
   }
 
-  return available[0] || config.active_pack
+  return available[0] || activePack
 }
 
 function escapeAppleScript(s: string): string {
@@ -465,8 +467,50 @@ function playSound(
       isWSL = /microsoft/i.test(ver)
     } catch {}
 
-    if (false) {
-      // WSL PowerShell disabled — using paplay instead
+    if (isWSL) {
+        // Route audio through the WSL PulseAudio server so it hits peon_sink,
+        // which feeds both the local RDP loopback (speakers) and the Icecast stream.
+      const pulseServer = process.env.PULSE_SERVER ?? "unix:/mnt/wslg/PulseServer"
+      const paVol = Math.round(Math.max(0, Math.min(65536, volume * 65536)))
+      const env = { ...process.env, PULSE_SERVER: pulseServer }
+	  
+      const pulsePlayed = (() => {
+        const backends: string[][] = [
+          ["pw-play", "--volume", String(volume), filePath],
+          ["paplay", `--volume=${paVol}`, filePath],
+        ]
+        for (const args of backends) {
+          try {
+            const which = Bun.spawnSync(["which", args[0]], { stdout: "pipe", stderr: "ignore" })
+            if (which.exitCode !== 0) continue
+            const proc = Bun.spawn(args, { env, stdout: "ignore", stderr: "ignore" })
+            proc.unref()
+            return true
+          } catch {}
+        }
+        return false
+      })()
+	  
+      if (!pulsePlayed) {
+        // Fallback: play directly on the Windows host via PowerShell (not captured by Icecast)
+        const distro = process.env.WSL_DISTRO_NAME ?? "Ubuntu"
+        const uri = `file:////wsl.localhost/${distro}${filePath}`
+        const cmd = [
+          "Add-Type -AssemblyName PresentationCore",
+          `$p = New-Object System.Windows.Media.MediaPlayer`,
+          `$p.Open([Uri]::new('${uri}'))`,
+          `$p.Volume = ${volume}`,
+          "Start-Sleep -Milliseconds 200",
+          "$p.Play()",
+          "Start-Sleep -Seconds 3",
+          "$p.Close()",
+        ].join("; ")
+        const proc = Bun.spawn(
+          ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmd],
+          { stdout: "ignore", stderr: "ignore" },
+        )
+        proc.unref()
+      }
     } else {
       // Mirror peon.sh priority chain with per-backend volume scaling
       const paVol = Math.round(Math.max(0, Math.min(65536, volume * 65536)))
@@ -650,7 +694,7 @@ async function isTerminalFocused(): Promise<boolean> {
 // ---------------------------------------------------------------------------
 
 function setTabTitle(title: string): void {
-  fs.writeFileSync("/tmp/peon-title", title, "utf8");
+  process.stdout.write(`\x1b]0;${title}\x07`); fs.writeFileSync("/tmp/peon-title", title, "utf8")
 }
 
 // ---------------------------------------------------------------------------
@@ -675,7 +719,6 @@ function setTabTitle(title: string): void {
 // ---------------------------------------------------------------------------
 
 export const PeonPingPlugin: Plugin = async ({ directory }) => {
-  console.log("[peon-ping] plugin initialized")
   const projectName = path.basename(directory || process.cwd()) || "opencode"
 
   const config = loadConfig()
